@@ -1,124 +1,40 @@
 import { PanelExtensionContext } from "@foxglove/extension";
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useState } from "react";
 import { createRoot } from "react-dom/client";
 
 type Waypoint = { x: number; y: number; z: number };
 
+type PanelState = {
+  frameId?: string;
+  pathTopic?: string;
+  markerTopic?: string;
+};
+
 function PathPlannerPanel({ context }: { context: PanelExtensionContext }): JSX.Element {
-  const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const [waypoints, setWaypoints] = useState<Waypoint[]>([]);
-  const [frameId, setFrameId] = useState<string>("map");
-  const [pathTopic, setPathTopic] = useState<string>("/planned_path");
-  const [markerTopic, setMarkerTopic] = useState<string>("/planned_path_markers");
   const [renderDone, setRenderDone] = useState<(() => void) | undefined>();
 
-  // Basic render driver
+  const [state, setState] = useState<PanelState>(() => {
+    return (context.initialState as PanelState) ?? {
+      frameId: "map",
+      pathTopic: "/planned_path",
+      markerTopic: "/planned_path_markers",
+    };
+  });
+
+  useEffect(() => {
+    context.saveState(state);
+  }, [context, state]);
+
   useLayoutEffect(() => {
-    context.onRender = (_renderState, done) => {
+    context.onRender = (_, done) => {
       setRenderDone(() => done);
     };
-    context.watch("topics");
-    context.watch("currentFrame");
   }, [context]);
 
   useEffect(() => {
     renderDone?.();
   }, [renderDone]);
-
-  // Simple mouse-to-plane mapping on a 2D canvas (XY in meters)
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) {
-      return;
-    }
-    const state = {
-      scale: 10, // pixels per meter
-      originX: canvas.width / 2,
-      originY: canvas.height / 2,
-    };
-    const toWorld = (cx: number, cy: number) => {
-      const x = (cx - state.originX) / state.scale;
-      const y = -(cy - state.originY) / state.scale;
-      return { x, y, z: 0 };
-    };
-    const onClick = (ev: MouseEvent) => {
-      const rect = canvas.getBoundingClientRect();
-      const cx = ev.clientX - rect.left;
-      const cy = ev.clientY - rect.top;
-      const p = toWorld(cx, cy);
-      setWaypoints((prev) => [...prev, p]);
-    };
-    canvas.addEventListener("click", onClick);
-    return () => {
-      canvas.removeEventListener("click", onClick);
-    };
-  }, []);
-
-  // Draw waypoints and lines
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) {
-      return;
-    }
-    const ctx = canvas.getContext("2d");
-    if (!ctx) {
-      return;
-    }
-    const scale = 10;
-    const originX = canvas.width / 2;
-    const originY = canvas.height / 2;
-    const toCanvas = (p: Waypoint) => ({
-      x: originX + p.x * scale,
-      y: originY - p.y * scale,
-    });
-    // clear
-    ctx.fillStyle = "#111";
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    // grid
-    ctx.strokeStyle = "#222";
-    ctx.lineWidth = 1;
-    for (let i = 0; i < canvas.width; i += scale) {
-      ctx.beginPath();
-      ctx.moveTo(i, 0);
-      ctx.lineTo(i, canvas.height);
-      ctx.stroke();
-    }
-    for (let j = 0; j < canvas.height; j += scale) {
-      ctx.beginPath();
-      ctx.moveTo(0, j);
-      ctx.lineTo(canvas.width, j);
-      ctx.stroke();
-    }
-    // axis
-    ctx.strokeStyle = "#444";
-    ctx.beginPath();
-    ctx.moveTo(0, originY);
-    ctx.lineTo(canvas.width, originY);
-    ctx.moveTo(originX, 0);
-    ctx.lineTo(originX, canvas.height);
-    ctx.stroke();
-    // line strip
-    if (waypoints.length > 1) {
-      ctx.strokeStyle = "#0af";
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      const p0 = toCanvas(waypoints[0]!);
-      ctx.moveTo(p0.x, p0.y);
-      for (let i = 1; i < waypoints.length; i++) {
-        const pi = toCanvas(waypoints[i]!);
-        ctx.lineTo(pi.x, pi.y);
-      }
-      ctx.stroke();
-    }
-    // points
-    ctx.fillStyle = "#fff";
-    for (const p of waypoints) {
-      const c = toCanvas(p);
-      ctx.beginPath();
-      ctx.arc(c.x, c.y, 3, 0, Math.PI * 2);
-      ctx.fill();
-    }
-  }, [waypoints]);
 
   function nowStamp() {
     const nowMs = Date.now();
@@ -128,67 +44,82 @@ function PathPlannerPanel({ context }: { context: PanelExtensionContext }): JSX.
   }
 
   function publishPath() {
+    if (waypoints.length === 0) {
+      return;
+    }
+
     const stamp = nowStamp();
     const pathMsg = {
-      header: { stamp, frame_id: frameId },
+      header: { stamp, frame_id: state.frameId ?? "map" },
       poses: waypoints.map((p) => ({
-        header: { stamp, frame_id: frameId },
+        header: { stamp, frame_id: state.frameId ?? "map" },
         pose: { position: { x: p.x, y: p.y, z: p.z }, orientation: { x: 0, y: 0, z: 0, w: 1 } },
       })),
     };
+    
     (context as any).publish?.({
-      topic: pathTopic,
+      topic: state.pathTopic ?? "/planned_path",
       schemaName: "nav_msgs/Path",
       value: pathMsg,
     });
 
-    const markerMsg = {
-      markers: [
-        {
-          ns: "path",
-          id: 1,
-          type: 4, // LINE_STRIP
-          action: 0,
-          header: { stamp, frame_id: frameId },
-          scale: { x: 0.03, y: 0.0, z: 0.0 },
-          color: { r: 0.0, g: 0.7, b: 1.0, a: 1.0 },
-          points: waypoints.map((p) => ({ x: p.x, y: p.y, z: p.z })),
-          lifetime: { sec: 0, nsec: 0 },
-        },
-        ...waypoints.map((p, idx) => ({
-          ns: "path_points",
-          id: 1000 + idx,
-          type: 2, // SPHERE
-          action: 0,
-          header: { stamp, frame_id: frameId },
-          scale: { x: 0.1, y: 0.1, z: 0.1 },
-          color: { r: 1.0, g: 1.0, b: 1.0, a: 1.0 },
-          pose: { position: { x: p.x, y: p.y, z: p.z }, orientation: { x: 0, y: 0, z: 0, w: 1 } },
-          lifetime: { sec: 0, nsec: 0 },
-        })),
-      ],
+    alert(`已发布 ${waypoints.length} 个路径点到话题 ${state.pathTopic}`);
+  }
+
+  function addWaypoint() {
+    const newWaypoint = {
+      x: Math.random() * 10 - 5,
+      y: Math.random() * 10 - 5, 
+      z: 0
     };
-    (context as any).publish?.({
-      topic: markerTopic,
-      schemaName: "visualization_msgs/MarkerArray",
-      value: markerMsg,
-    });
+    setWaypoints(prev => [...prev, newWaypoint]);
   }
 
   return (
-    <div style={{ display: "grid", gridTemplateRows: "auto 1fr", gap: 8, height: "100%", padding: "1rem" }}>
-      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-        <label>frame_id</label>
-        <input value={frameId} onChange={(e) => setFrameId(e.target.value)} style={{ width: 120 }} />
-        <label>Path topic</label>
-        <input value={pathTopic} onChange={(e) => setPathTopic(e.target.value)} style={{ width: 160 }} />
-        <label>Marker topic</label>
-        <input value={markerTopic} onChange={(e) => setMarkerTopic(e.target.value)} style={{ width: 180 }} />
-        <button onClick={() => setWaypoints([])}>清空</button>
-        <button onClick={() => waypoints.length > 0 && publishPath()}>发布轨迹</button>
-        <div>点数: {waypoints.length}</div>
+    <div style={{ padding: "1rem" }}>
+      <h3>3D 路径规划器</h3>
+      
+      <div style={{ display: "flex", gap: "8px", marginBottom: "16px", flexWrap: "wrap" }}>
+        <div>
+          <label>frame_id: </label>
+          <input
+            value={state.frameId ?? "map"}
+            onChange={(e) => setState({ ...state, frameId: e.target.value })}
+            style={{ width: "100px" }}
+          />
+        </div>
+        <div>
+          <label>Path topic: </label>
+          <input
+            value={state.pathTopic ?? "/planned_path"}
+            onChange={(e) => setState({ ...state, pathTopic: e.target.value })}
+            style={{ width: "150px" }}
+          />
+        </div>
       </div>
-      <canvas ref={canvasRef} width={640} height={480} style={{ width: "100%", height: "100%", background: "#111" }} />
+
+      <div style={{ display: "flex", gap: "8px", marginBottom: "16px" }}>
+        <button onClick={addWaypoint}>添加随机路径点</button>
+        <button onClick={() => setWaypoints([])}>清空路径</button>
+        <button onClick={publishPath} disabled={waypoints.length === 0}>
+          发布轨迹 ({waypoints.length})
+        </button>
+      </div>
+
+      <div>
+        <h4>当前路径点:</h4>
+        <div style={{ maxHeight: "200px", overflow: "auto", border: "1px solid #ccc", padding: "8px" }}>
+          {waypoints.map((wp, index) => (
+            <div key={index}>
+              点 {index + 1}: ({wp.x.toFixed(2)}, {wp.y.toFixed(2)}, {wp.z.toFixed(2)})
+            </div>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ marginTop: "16px", padding: "8px", background: "#f0f0f0", borderRadius: "4px" }}>
+        <strong>说明:</strong> 这是一个简化版本的路径规划器。点击"添加随机路径点"来创建路径，然后点击"发布轨迹"将路径发布为ROS消息。
+      </div>
     </div>
   );
 }
@@ -198,4 +129,3 @@ export function initPathPlannerPanel(context: PanelExtensionContext): () => void
   root.render(<PathPlannerPanel context={context} />);
   return () => root.unmount();
 }
-
